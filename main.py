@@ -61,8 +61,8 @@ REQ = [0x06, 0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 POLL_SEC = 30        # 正常刷新间隔
 RETRY_SEC = 5        # 未连接时的探测间隔
-HIGH_WHITE = (0xFF, 0xFF, 0xFF)  # 浅色模式：白图标，配深色任务栏（默认）
-HIGH_BLACK = (0x00, 0x00, 0x00)  # 深色模式：黑图标，配浅色任务栏
+HIGH_WHITE = (0xFF, 0xFF, 0xFF)  # 白图标：配深色任务栏（默认）
+HIGH_BLACK = (0x00, 0x00, 0x00)  # 黑图标：配浅色任务栏
 MID = (0xF0, 0xC0, 0x40)         # 21-50% 黄：两种模式都一样
 LOW = (0xE6, 0x40, 0x40)         # <=20% 红：两种模式都一样
 GONE = (0x99, 0x99, 0x99)
@@ -173,19 +173,23 @@ def _font(size):
     return _FONT_CACHE[size]
 
 
-#: 图标模式：False=浅色模式（白图标），True=深色模式（黑图标）。
+#: 图标颜色：False=白图标，True=黑图标。
 #: 只影响 >50% 那一档，黄/红固定不变——颜色只留给告警。
-_DARK_ICON = [False]
-#: 最近一次读到的电量。切换模式要立刻重绘，不能等下一次轮询（最长 30 秒）。
+_BLACK_ICON = [False]
+#: 最近一次读到的电量。切换颜色要立刻重绘，不能等下一次轮询（最长 30 秒）。
 _LAST_PCT = [-1]
 MODE_PATH = os.path.join(_HERE, "sora_v3_battery.mode")
 
 
 def _load_mode():
-    """读取上次记住的图标模式；读不到就默认白图标。"""
+    """读取上次记住的图标颜色；读不到就默认白图标。
+
+    旧版本写的是 "dark"/"light"，一并以黑处理：升级不该把用户选的黑色图标
+    悄悄改回白色 —— 那正是这个功能要防的情况。
+    """
     try:
         with open(MODE_PATH, encoding="utf-8") as f:
-            return f.read().strip() == "dark"
+            return f.read().strip() in ("black", "dark")
     except Exception:
         return False
 
@@ -194,12 +198,12 @@ def _save_mode():
     """记住选择。存不下最多是下次回到默认，不该影响运行。"""
     try:
         with open(MODE_PATH, "w", encoding="utf-8") as f:
-            f.write("dark" if _DARK_ICON[0] else "light")
+            f.write("black" if _BLACK_ICON[0] else "white")
     except Exception:
         pass
 
 
-_DARK_ICON[0] = _load_mode()
+_BLACK_ICON[0] = _load_mode()
 
 
 def _color(pct):
@@ -209,7 +213,7 @@ def _color(pct):
         return LOW
     if pct <= 50:
         return MID
-    return HIGH_BLACK if _DARK_ICON[0] else HIGH_WHITE
+    return HIGH_BLACK if _BLACK_ICON[0] else HIGH_WHITE
 
 
 def _ink(font, text, stroke):
@@ -307,16 +311,15 @@ def title_for(pct):
 
 
 def _mode_label(item):
-    """菜单文字说明「点了会变成哪种」，所以显示的是当前模式的另一种。"""
-    return "切换浅色模式" if _DARK_ICON[0] else "切换深色模式"
+    """菜单文字说的是「点了会变成哪样」，所以显示的是另一种颜色。"""
+    return "用白色图标" if _BLACK_ICON[0] else "用黑色图标"
 
 
 def _toggle_icon_mode(icon, item):
     """白/黑图标互切：立刻重绘，并刷新菜单文字。"""
-    _DARK_ICON[0] = not _DARK_ICON[0]
+    _BLACK_ICON[0] = not _BLACK_ICON[0]
     _save_mode()
-    logging.info("icon mode -> %s",
-                 "深色(黑图标)" if _DARK_ICON[0] else "浅色(白图标)")
+    logging.info("icon colour -> %s", "黑图标" if _BLACK_ICON[0] else "白图标")
     try:
         icon.icon = make_icon(_LAST_PCT[0])
         icon.update_menu()
