@@ -2,7 +2,8 @@
 
 常驻 Windows 系统托盘，实时显示 Ninjutso Sora V3 鼠标电量百分比；
 电量跌破阈值时弹 Windows 通知（去重逻辑见 alerts.py）。
-协议（逆向自 ClickSync）：VID 093A / PID EB02，HID feature report 0x06，
+协议（逆向自 ClickSync）：VID 093A / PID EB02（4K 接收器）或 PID E010
+（有线模式下的鼠标本体，充电时接收器不可见），HID feature report 0x06，
 命令 0x12，回包第 8 字节为电量。
 
 用法：
@@ -59,6 +60,7 @@ def _patch_pystray_message_filter():
 _patch_pystray_message_filter()
 
 VID, PID = 0x093A, 0xEB02          # Sora V3 4K 接收器
+WIRED_PID = 0xE010                 # 有线模式下的鼠标本体（此时接收器不可见，见 README 踩坑记录）
 RID = 0x06                          # 主通道 feature report ID
 USAGE_PAGE, USAGE = 0xFF01, 0x0001  # 电量 collection 的 usage（MI_02 上有两个同值 collection）
 REQ = [0x06, 0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -70,6 +72,7 @@ HIGH_BLACK = (0x00, 0x00, 0x00)  # 黑图标：配浅色任务栏
 MID = (0xF0, 0xC0, 0x40)         # 21-50% 黄：两种模式都一样
 LOW = (0xE6, 0x40, 0x40)         # <=20% 红：两种模式都一样
 GONE = (0x99, 0x99, 0x99)
+CHARGING = (0x40, 0xC0, 0xF0)    # 充电中：青色，不随电量变化（红/黄是告警色，插着线不该报）
 
 LOG_PATH = os.path.join(_HERE, "sora_v3_battery.log")
 LOG_MAX_BYTES = 512 * 1024   # 单文件上限 512 KiB（约 3~4 天的轮询记录）
@@ -81,20 +84,27 @@ logging.basicConfig(
                                   backupCount=LOG_BACKUPS, encoding="utf-8")],
 )
 
-_GOOD_PATH = []   # 上次读成功的 collection，避免每次先试坏的那个
+_GOOD_PATH = []   # 上次读成功的 (pid, path)，避免每次先试坏的那个
 
 
 def candidate_paths():
-    """所有 usage_page/usage 匹配的 collection（MI_02 上有两个，仅后一个可读）。"""
-    out = []
+    """VID 下所有电量 collection，按设备分组：{接收器 PID: [...], 有线本体 PID: [...]}。
+
+    有线模式下接收器的 collection 会从 HID 枚举里消失，鼠标本体以
+    PID E010 出现，电量协议相同（见 README 踩坑记录 4）。
+    """
+    groups = {PID: [], WIRED_PID: []}
     try:
-        for info in hid.enumerate(VID, PID):
+        for info in hid.enumerate(VID):
+            pid = info.get("product_id")
+            if pid not in groups:
+                continue
             if (info.get("usage_page") == USAGE_PAGE
                     and info.get("usage") == USAGE):
-                out.append(info["path"])
+                groups[pid].append(info["path"])
     except Exception as e:
         logging.warning("enumerate failed: %s", e)
-    return out
+    return groups
 
 
 def _try_read(path):
@@ -120,18 +130,24 @@ def _try_read(path):
 
 
 def read_battery():
-    """依次尝试匹配的 collection，返回第一个成功读到的电量；无则 None。"""
-    paths = candidate_paths()
-    if _GOOD_PATH and _GOOD_PATH[0] in paths:
-        paths = [_GOOD_PATH[0]] + [p for p in paths if p != _GOOD_PATH[0]]
-    for p in paths:
-        pct = _try_read(p)
-        if pct is not None:
-            if not _GOOD_PATH or _GOOD_PATH[0] != p:
-                _GOOD_PATH[:] = [p]
-                logging.info("using path: %s", p)
-            return pct
-    return None
+    """读电量，返回 (pct, charging)；读不到返回 (None, False)。
+
+    有线本体优先：它出现在枚举里时鼠标必然插着线（接收器此时读不到
+    它），从本体读才能把「充电中」如实显示出来；本体不在则回落接收器。
+    """
+    groups = candidate_paths()
+    for pid, charging in ((WIRED_PID, True), (PID, False)):
+        paths = groups[pid]
+        if _GOOD_PATH and _GOOD_PATH[0][0] == pid and _GOOD_PATH[0][1] in paths:
+            paths = [_GOOD_PATH[0][1]] + [p for p in paths if p != _GOOD_PATH[0][1]]
+        for p in paths:
+            pct = _try_read(p)
+            if pct is not None:
+                if not _GOOD_PATH or _GOOD_PATH[0] != (pid, p):
+                    _GOOD_PATH[:] = [(pid, p)]
+                    logging.info("using path: %s (pid=%04X)", p, pid)
+                return pct, charging
+    return None, False
 
 
 # --- 托盘图标渲染 -----------------------------------------------------------
@@ -182,6 +198,8 @@ def _font(size):
 _BLACK_ICON = [False]
 #: 最近一次读到的电量。切换颜色要立刻重绘，不能等下一次轮询（最长 30 秒）。
 _LAST_PCT = [-1]
+#: 最近一次是否在充电（有线本体在线）。配合 _LAST_PCT 让重绘保留充电色。
+_LAST_CHARGING = [False]
 MODE_PATH = os.path.join(_HERE, "sora_v3_battery.mode")
 
 
@@ -210,9 +228,11 @@ def _save_mode():
 _BLACK_ICON[0] = _load_mode()
 
 
-def _color(pct):
+def _color(pct, charging=False):
     if pct < 0:
         return GONE
+    if charging:
+        return CHARGING
     if pct <= 20:
         return LOW
     if pct <= 50:
@@ -295,11 +315,11 @@ def _draw_battery(dr, pct, color):
             radius=round(8 * k), fill=color)
 
 
-def make_icon(pct):
+def make_icon(pct, charging=False):
     """把电量画成托盘图标：超采样绘制后 LANCZOS 缩到 ICON_NATIVE。"""
     img = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (0, 0, 0, 0))
     dr = ImageDraw.Draw(img)
-    color = _color(pct)
+    color = _color(pct, charging)
     if pct < 0 or ICON_STYLE == "digits":
         # 未连接一律用文字占位：空电池会被误读成 0%
         _draw_text(dr, "--" if pct < 0 else str(pct), color)
@@ -308,9 +328,11 @@ def make_icon(pct):
     return img.resize((ICON_NATIVE, ICON_NATIVE), Image.LANCZOS)
 
 
-def title_for(pct):
+def title_for(pct, charging=False):
     if pct < 0:
         return "Sora V3: 未连接"
+    if charging:
+        return "Sora V3: 充电中 %d%%" % pct
     return "Sora V3: %d%%" % pct
 
 
@@ -325,7 +347,7 @@ def _toggle_icon_mode(icon, item):
     _save_mode()
     logging.info("icon colour -> %s", "黑图标" if _BLACK_ICON[0] else "白图标")
     try:
-        icon.icon = make_icon(_LAST_PCT[0])
+        icon.icon = make_icon(_LAST_PCT[0], _LAST_CHARGING[0])
         icon.update_menu()
     except Exception as e:
         logging.warning("mode toggle failed: %s", e)
@@ -375,15 +397,19 @@ def poll_loop(icon, stop_evt, alerter, alert_cfg):
     icon.visible = True
     logging.info("poll loop started")
     while not stop_evt.is_set():
-        pct = read_battery()
+        pct, charging = read_battery()
         _LAST_PCT[0] = -1 if pct is None else pct
-        logging.info("state: %s", "disconnected" if pct is None else "%d%%" % pct)
+        _LAST_CHARGING[0] = bool(charging and pct is not None)
+        logging.info("state: %s", "disconnected" if pct is None
+                     else "%d%%%s" % (pct, " charging" if charging else ""))
         try:
-            icon.icon = make_icon(_LAST_PCT[0])
-            icon.title = title_for(pct if pct is not None else -1)
+            icon.icon = make_icon(_LAST_PCT[0], _LAST_CHARGING[0])
+            icon.title = title_for(pct if pct is not None else -1, _LAST_CHARGING[0])
         except Exception as e:
             logging.warning("icon update failed: %s", e)
-        if pct is not None and alert_cfg["enabled"]:
+        # 充电中不告警：插着线弹「请立即充电」是误报；回升会自然越过
+        # 迟滞线重新武装，拔线后若仍在低电区会在下一个读数补报
+        if pct is not None and not charging and alert_cfg["enabled"]:
             stage = alerter.update(pct)
             if stage is not None:
                 title, body = alert_message(stage, pct, alerter.urgent_stage)
@@ -433,14 +459,16 @@ def _say(msg):
 
 
 def run_once():
-    if not candidate_paths():
-        _say("DISCONNECTED: no Sora V3 (VID %04X PID %04X)" % (VID, PID))
+    groups = candidate_paths()
+    if not groups[PID] and not groups[WIRED_PID]:
+        _say("DISCONNECTED: no Sora V3 (VID %04X PID %04X/%04X)"
+             % (VID, PID, WIRED_PID))
         return 1
-    pct = read_battery()
+    pct, charging = read_battery()
     if pct is None:
         _say("NO_RESPONSE: device present but no battery returned")
         return 1
-    _say("BATTERY %d%%" % pct)
+    _say("BATTERY %d%%%s" % (pct, " CHARGING" if charging else ""))
     return 0
 
 
