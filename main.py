@@ -129,22 +129,46 @@ def read_battery():
     return None
 
 
+# --- 托盘图标渲染 -----------------------------------------------------------
+# pystray 用 LoadImage(..., LR_DEFAULTSIZE) 载入图标，无论传入多大的图都会被
+# 重采样到 SM_CXICON（本机 32x32）。所以按 32 渲染是唯一能省掉那次重采样的
+# 尺寸：更大只会被压回去（两次廉价滤波叠加 = 糊），更小则先放大再缩小。
+ICON_NATIVE = 32                  # pystray 最终得到的 HICON 边长
+ICON_SS = 4                       # 内部超采样倍数，画完用 LANCZOS 缩回 ICON_NATIVE
+ICON_CANVAS = ICON_NATIVE * ICON_SS
+ICON_MARGIN = max(2, round(ICON_CANVAS * 4 / 256))   # 留给抗锯齿的边
+ICON_BOX = ICON_CANVAS - 2 * ICON_MARGIN
+
+#: 图标样式："battery" 画电池图形（默认），"digits" 直接画百分比数字。
+ICON_STYLE = "battery"
+
+#: 数字按长度分两档拟合：<=2 字符按最宽的两字符串定字号，"100" 单独一档。
+#: 若全部按 "100" 拟合，常见的两位数会被压小。
+_SIZE_REF_SHORT = tuple(str(n) for n in range(10, 100)) + ("--",)
+_SIZE_REF_LONG = ("100",)
+
+_SCRATCH_IMG = Image.new("RGBA", (8, 8))
+_SCRATCH = ImageDraw.Draw(_SCRATCH_IMG)
 _FONT_CACHE = {}
+_SIZE_CACHE = {}
+
+
+def _font_path():
+    root = os.environ.get("WINDIR", "C:/Windows")
+    for name in ("seguisb.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"):
+        p = os.path.join(root, "Fonts", name)
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def _font(size):
     if size not in _FONT_CACHE:
-        f = None
-        root = os.environ.get("WINDIR", "C:/Windows")
-        for name in ("seguisb.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"):
-            p = os.path.join(root, "Fonts", name)
-            if os.path.exists(p):
-                try:
-                    f = ImageFont.truetype(p, size)
-                    break
-                except Exception:
-                    pass
-        _FONT_CACHE[size] = f
+        path = _font_path()
+        try:
+            _FONT_CACHE[size] = ImageFont.truetype(path, size) if path else None
+        except Exception:
+            _FONT_CACHE[size] = None
     return _FONT_CACHE[size]
 
 
@@ -158,34 +182,92 @@ def _color(pct):
     return HIGH
 
 
+def _ink(font, text, stroke):
+    """串在给定字体/描边下的墨迹宽高。"""
+    l, t, r, b = _SCRATCH.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    return r - l, b - t
+
+
+def _fitted_size(stroke, candidates):
+    """让 candidates 中最宽的串也能塞进 ICON_BOX 的最大字号。
+
+    关键：字号按**一组候选串**拟合，而不是按当前这一个串 —— 否则 "5" 会被
+    撑满、"100" 会被压小，电量每跳一格数字大小就变一次，看着很跳。
+    """
+    key = (stroke, candidates)
+    if key in _SIZE_CACHE:
+        return _SIZE_CACHE[key]
+    path = _font_path()
+    size = 8
+    if path is not None:
+        ref = ImageFont.truetype(path, 100)
+        est = []
+        for s in candidates:
+            w, h = _ink(ref, s, 0)
+            if w > 0 and h > 0:
+                est.append(int(100 * min(ICON_BOX / w, ICON_BOX / h)))
+        size = max(8, min(ICON_BOX, min(est, default=ICON_BOX)))
+        # 每次回退只建一次字体对象：候选串有近百个，建在循环内会白白多建 90 倍
+        while size > 8:
+            font = ImageFont.truetype(path, size)
+            if all(max(_ink(font, s, stroke)) <= ICON_BOX for s in candidates):
+                break
+            size -= 1
+    _SIZE_CACHE[key] = size
+    return size
+
+
+def _outline_color(rgb):
+    """给文字描边选颜色：亮字配黑边、暗字配白边，才能在任意任务栏底色上可读。"""
+    r, g, b = rgb
+    return (0, 0, 0) if (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.5 else (255, 255, 255)
+
+
+def _draw_text(dr, text, color):
+    """画数字（或 -- 占位），按自身墨迹居中，带描边。"""
+    stroke = max(2, round(ICON_BOX / 28))
+    candidates = _SIZE_REF_LONG if len(text) >= 3 else _SIZE_REF_SHORT
+    font = _font(_fitted_size(stroke, candidates))
+    if font is None:
+        return
+    l, t, r, b = dr.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    dr.text((round((ICON_CANVAS - (r - l)) / 2 - l),
+             round((ICON_CANVAS - (b - t)) / 2 - t)),
+            text, font=font, fill=color, stroke_width=stroke,
+            stroke_fill=_outline_color(color))
+
+
+def _draw_battery(dr, pct, color):
+    """画电池图形：圆角外壳 + 正极头 + 按电量比例填充。
+
+    几何用 256 的设计基准等比缩到 ICON_CANVAS，改比例时只动这些常数。
+    """
+    k = ICON_CANVAS / 256.0
+    stroke = round(16 * k)
+    dr.rounded_rectangle(
+        (round(16 * k), round(72 * k), round(224 * k), round(184 * k)),
+        radius=round(20 * k), outline=color, width=stroke)
+    dr.rounded_rectangle(
+        (round(226 * k), round(100 * k), round(248 * k), round(156 * k)),
+        radius=round(8 * k), fill=color)
+    fw = round(160 * pct / 100.0 * k)
+    if pct > 0 and fw > 0:
+        dr.rounded_rectangle(
+            (round(40 * k), round(96 * k), round(40 * k) + fw, round(96 * k) + round(64 * k)),
+            radius=round(8 * k), fill=color)
+
+
 def make_icon(pct):
-    """把电量画成托盘图标：数字 + 底部电量条。"""
-    S = 64
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    """把电量画成托盘图标：超采样绘制后 LANCZOS 缩到 ICON_NATIVE。"""
+    img = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (0, 0, 0, 0))
     dr = ImageDraw.Draw(img)
     color = _color(pct)
-    label = "--" if pct < 0 else str(pct)
-    size = 46
-    while size > 10:
-        f = _font(size)
-        if f is None:
-            break
-        l, t, r, b = dr.textbbox((0, 0), label, font=f)
-        if (r - l) <= 56 and (b - t) <= 44:
-            break
-        size -= 2
-    f = _font(size)
-    if f is not None:
-        l, t, r, b = dr.textbbox((0, 0), label, font=f)
-        dr.text(((S - (r - l)) / 2 - l, (S - (b - t)) / 2 - t - 3), label, font=f, fill=color)
+    if pct < 0 or ICON_STYLE == "digits":
+        # 未连接一律用文字占位：空电池会被误读成 0%
+        _draw_text(dr, "--" if pct < 0 else str(pct), color)
     else:
-        dr.rectangle((10, 18, 54, 42), outline=color, width=3)
-    if pct >= 0:
-        dr.rectangle((8, 55, 56, 61), outline=color, width=1)
-        w = int(46 * pct / 100.0)
-        if w > 0:
-            dr.rectangle((10, 57, 10 + w, 59), fill=color)
-    return img
+        _draw_battery(dr, pct, color)
+    return img.resize((ICON_NATIVE, ICON_NATIVE), Image.LANCZOS)
 
 
 def title_for(pct):
