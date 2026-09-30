@@ -1,6 +1,7 @@
 """Sora V3 电量托盘指示器。
 
-常驻 Windows 系统托盘，实时显示 Ninjutso Sora V3 鼠标电量百分比。
+常驻 Windows 系统托盘，实时显示 Ninjutso Sora V3 鼠标电量百分比；
+电量跌破阈值时弹 Windows 通知（去重逻辑见 alerts.py）。
 协议（逆向自 ClickSync）：VID 093A / PID EB02，HID feature report 0x06，
 命令 0x12，回包第 8 字节为电量。
 
@@ -10,6 +11,7 @@
 """
 import os
 import sys
+import json
 import time
 import threading
 import logging
@@ -27,6 +29,8 @@ if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
 import hid
 import pystray
 from PIL import Image, ImageDraw, ImageFont
+
+from alerts import LowBatteryAlerter, alert_message
 
 
 def _patch_pystray_message_filter():
@@ -194,8 +198,46 @@ def title_for(pct):
     return "Sora V3: %d%%" % pct
 
 
-def poll_loop(icon, stop_evt):
-    """setup 线程：先显示图标，再轮询电量刷新。"""
+# ---- 低电量提示的开关持久化 ------------------------------------------------
+
+CONFIG_PATH = os.path.join(_HERE, "sora_v3_battery.json")
+_DEFAULT_CFG = {"alerts_enabled": True, "alert_warn": 20, "alert_urgent": 10}
+
+
+def load_config():
+    """读配置；缺失/损坏/越界一律回落默认值，绝不影响主功能。"""
+    cfg = dict(_DEFAULT_CFG)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return cfg
+        if isinstance(raw.get("alerts_enabled"), bool):
+            cfg["alerts_enabled"] = raw["alerts_enabled"]
+        for key in ("alert_warn", "alert_urgent"):
+            v = raw.get(key)
+            if isinstance(v, int) and 0 <= v <= 100:
+                cfg[key] = v
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.warning("config read failed: %s", e)
+    return cfg
+
+
+def save_config(cfg):
+    """临时文件 + os.replace 原子写，避免半截 JSON。"""
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+    except Exception as e:
+        logging.warning("config write failed: %s", e)
+
+
+def poll_loop(icon, stop_evt, alerter, alert_cfg):
+    """setup 线程：先显示图标，再轮询电量刷新 + 低电量判断。"""
     # 必须显式显示：pystray 只在 *没有* setup 回调时才自动 visible=True
     icon.visible = True
     logging.info("poll loop started")
@@ -207,6 +249,17 @@ def poll_loop(icon, stop_evt):
             icon.title = title_for(pct if pct is not None else -1)
         except Exception as e:
             logging.warning("icon update failed: %s", e)
+        if pct is not None and alert_cfg["enabled"]:
+            stage = alerter.update(pct)
+            if stage is not None:
+                title, body = alert_message(stage, pct, alerter.urgent_stage)
+                logging.info("low battery alert: stage=%d pct=%d", stage, pct)
+                try:
+                    # 气泡在 Win10/11 上渲染为系统 toast，同 Shell_NotifyIcon
+                    # 路径，与上面跨线程刷新图标一致，可安全调用
+                    icon.notify(body, title)
+                except Exception as e:
+                    logging.warning("notify failed: %s", e)
         stop_evt.wait(RETRY_SEC if pct is None else POLL_SEC)
     logging.info("poll loop stopped")
 
@@ -265,14 +318,34 @@ def main():
         # 用 debug 级别避免日志被这条正常路径刷屏。
         logging.debug("another instance is already running; exiting")
         return 0
+    cfg = load_config()
+    alert_cfg = {"enabled": cfg["alerts_enabled"]}
+    alerter = LowBatteryAlerter(stages=(cfg["alert_warn"], cfg["alert_urgent"]))
+
+    def _toggle_alerts(icon, item):
+        alert_cfg["enabled"] = not alert_cfg["enabled"]
+        cfg.update(alerts_enabled=alert_cfg["enabled"])
+        save_config(cfg)
+        logging.info("alerts toggled: %s", alert_cfg["enabled"])
+
+    def _test_notify(icon, item):
+        try:
+            icon.notify("这是测试通知。低电量提示触发时你会看到同样的气泡。",
+                        "Sora V3 电量提示（测试）")
+        except Exception as e:
+            logging.warning("test notify failed: %s", e)
+
     stop_evt = threading.Event()
     icon = pystray.Icon("sora_v3_battery", make_icon(-1), title_for(-1))
     icon.menu = pystray.Menu(
+        pystray.MenuItem("低电量提示", _toggle_alerts,
+                         checked=lambda item: alert_cfg["enabled"]),
+        pystray.MenuItem("测试通知", _test_notify),
         pystray.MenuItem("刷新", lambda icon, item: None, default=True),
         pystray.MenuItem("退出", lambda icon, item: (stop_evt.set(), icon.stop())),
     )
     logging.info("app starting")
-    icon.run(setup=lambda ic: poll_loop(ic, stop_evt))
+    icon.run(setup=lambda ic: poll_loop(ic, stop_evt, alerter, alert_cfg))
     return 0
 
 
