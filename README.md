@@ -75,6 +75,22 @@ pyinstaller --noconfirm --onedir --windowed --name SoraV3Battery \
 
 若图标被 Windows 收进「隐藏的图标」溢出区，到 **设置 → 个性化 → 任务栏 → 其他系统托盘图标** 里把它打开。
 
+## 开发环境说明
+
+### `pipfix/` 是什么
+
+`pipfix/sitecustomize.py` 是**特定受限环境**下的 workaround，不属于程序本身。某些沙箱按 `os.mkdir` 传入的 mode 判定写入权限，而 `tempfile.mkdtemp()` 用的正是 `0o700`，结果目录刚建出来就不可写 —— pip 会直接失败（`Permission denied: .../pip-unpack-xxxx/xxx.whl`），任何依赖 mkdtemp 的工具同理。
+
+把它放进 `PYTHONPATH`，解释器启动时会自动导入 `sitecustomize`，把 `0o700` 改写成 `0o777` 即可绕过：
+
+    set PYTHONPATH=<repo>\vendor;<repo>\pipfix
+
+普通 Windows 环境**不需要它**，删掉不影响程序运行。
+
+### 为什么没有 `vendor/`
+
+`vendor/` 是从 wheel 解压出来的第三方包，属于依赖而非源码，已写进 `.gitignore`。构建前先按 `requirements.txt` 装依赖，再执行下面「打包成 exe」。
+
 ## 实现要点
 
 - **单实例**：命名互斥体 `Local\SoraV3BatteryTray`，避免重复启动出现多个图标。
