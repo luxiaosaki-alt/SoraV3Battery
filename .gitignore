@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行时产物
+sora_v3_battery.log
+*.log
+
+# 本地下载的第三方依赖
+vendor/
+wheels/
+
+# 打包产物
+dist/
+build/
+*.spec
+pyi_config/
+
+# 临时目录
+tmp/

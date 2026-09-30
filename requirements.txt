@@ -1,0 +1,7 @@
+# 运行时依赖
+hidapi>=0.15.0
+pystray>=0.19.5
+Pillow>=10
+
+# 打包（可选）
+# pyinstaller>=6.0

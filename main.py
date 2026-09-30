@@ -1,0 +1,276 @@
+"""Sora V3 电量托盘指示器。
+
+常驻 Windows 系统托盘，实时显示 Ninjutso Sora V3 鼠标电量百分比。
+协议（逆向自 ClickSync）：VID 093A / PID EB02，HID feature report 0x06，
+命令 0x12，回包第 8 字节为电量。
+
+用法：
+    python main.py          # 常驻托盘
+    python main.py --once   # 读一次电量打印后退出（最小检查）
+"""
+import os
+import sys
+import time
+import threading
+import logging
+
+# 打包成 exe 时用 exe 所在目录（日志、vendor 都相对它）；源码运行时用脚本目录
+if getattr(sys, "frozen", False):
+    _HERE = os.path.dirname(sys.executable)
+else:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+_VENDOR = os.path.join(_HERE, "vendor")
+if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
+
+import hid
+import pystray
+from PIL import Image, ImageDraw, ImageFont
+
+
+def _patch_pystray_message_filter():
+    """兼容性 shim。
+
+    pystray 建窗口时调用 ChangeWindowMessageFilterEx 以捕获 explorer 重启
+    (WM_TASKBARCREATED)。该调用是可选的，但在受限令牌的进程里会抛
+    WinError 5（拒绝访问），导致托盘根本起不来。让它失败不致命即可。
+    """
+    try:
+        from pystray._util import win32 as _win32
+
+        _orig = _win32.ChangeWindowMessageFilterEx
+
+        def _safe(*args, **kwargs):
+            try:
+                return _orig(*args, **kwargs)
+            except Exception:
+                return None
+
+        _win32.ChangeWindowMessageFilterEx = _safe
+    except Exception:
+        pass
+
+
+_patch_pystray_message_filter()
+
+VID, PID = 0x093A, 0xEB02          # Sora V3 4K 接收器
+RID = 0x06                          # 主通道 feature report ID
+USAGE_PAGE, USAGE = 0xFF01, 0x0001  # 电量 collection 的 usage（MI_02 上有两个同值 collection）
+REQ = [0x06, 0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+POLL_SEC = 30        # 正常刷新间隔
+RETRY_SEC = 5        # 未连接时的探测间隔
+HIGH = (0x5A, 0xD2, 0x5A)    # >50% 绿
+MID = (0xF0, 0xC0, 0x40)     # 21-50% 黄
+LOW = (0xE6, 0x40, 0x40)     # <=20% 红
+GONE = (0x99, 0x99, 0x99)
+
+LOG_PATH = os.path.join(_HERE, "sora_v3_battery.log")
+logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+
+_GOOD_PATH = []   # 上次读成功的 collection，避免每次先试坏的那个
+
+
+def candidate_paths():
+    """所有 usage_page/usage 匹配的 collection（MI_02 上有两个，仅后一个可读）。"""
+    out = []
+    try:
+        for info in hid.enumerate(VID, PID):
+            if (info.get("usage_page") == USAGE_PAGE
+                    and info.get("usage") == USAGE):
+                out.append(info["path"])
+    except Exception as e:
+        logging.warning("enumerate failed: %s", e)
+    return out
+
+
+def _try_read(path):
+    """对单个 path 读一次电量；失败返回 None（绝不抛出）。"""
+    d = hid.device()
+    try:
+        d.open_path(path)
+        d.send_feature_report(REQ)
+        time.sleep(0.012)
+        r = d.get_feature_report(RID, 16)
+        if len(r) > 8 and 0 <= r[8] <= 100:
+            return r[8]
+        logging.warning("unexpected response: %s", list(r))
+        return None
+    except Exception as e:
+        logging.info("read failed on %s: %s", path, e)
+        return None
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+def read_battery():
+    """依次尝试匹配的 collection，返回第一个成功读到的电量；无则 None。"""
+    paths = candidate_paths()
+    if _GOOD_PATH and _GOOD_PATH[0] in paths:
+        paths = [_GOOD_PATH[0]] + [p for p in paths if p != _GOOD_PATH[0]]
+    for p in paths:
+        pct = _try_read(p)
+        if pct is not None:
+            if not _GOOD_PATH or _GOOD_PATH[0] != p:
+                _GOOD_PATH[:] = [p]
+                logging.info("using path: %s", p)
+            return pct
+    return None
+
+
+_FONT_CACHE = {}
+
+
+def _font(size):
+    if size not in _FONT_CACHE:
+        f = None
+        root = os.environ.get("WINDIR", "C:/Windows")
+        for name in ("seguisb.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"):
+            p = os.path.join(root, "Fonts", name)
+            if os.path.exists(p):
+                try:
+                    f = ImageFont.truetype(p, size)
+                    break
+                except Exception:
+                    pass
+        _FONT_CACHE[size] = f
+    return _FONT_CACHE[size]
+
+
+def _color(pct):
+    if pct < 0:
+        return GONE
+    if pct <= 20:
+        return LOW
+    if pct <= 50:
+        return MID
+    return HIGH
+
+
+def make_icon(pct):
+    """把电量画成托盘图标：数字 + 底部电量条。"""
+    S = 64
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    dr = ImageDraw.Draw(img)
+    color = _color(pct)
+    label = "--" if pct < 0 else str(pct)
+    size = 46
+    while size > 10:
+        f = _font(size)
+        if f is None:
+            break
+        l, t, r, b = dr.textbbox((0, 0), label, font=f)
+        if (r - l) <= 56 and (b - t) <= 44:
+            break
+        size -= 2
+    f = _font(size)
+    if f is not None:
+        l, t, r, b = dr.textbbox((0, 0), label, font=f)
+        dr.text(((S - (r - l)) / 2 - l, (S - (b - t)) / 2 - t - 3), label, font=f, fill=color)
+    else:
+        dr.rectangle((10, 18, 54, 42), outline=color, width=3)
+    if pct >= 0:
+        dr.rectangle((8, 55, 56, 61), outline=color, width=1)
+        w = int(46 * pct / 100.0)
+        if w > 0:
+            dr.rectangle((10, 57, 10 + w, 59), fill=color)
+    return img
+
+
+def title_for(pct):
+    if pct < 0:
+        return "Sora V3: 未连接"
+    return "Sora V3: %d%%" % pct
+
+
+def poll_loop(icon, stop_evt):
+    """setup 线程：先显示图标，再轮询电量刷新。"""
+    # 必须显式显示：pystray 只在 *没有* setup 回调时才自动 visible=True
+    icon.visible = True
+    logging.info("poll loop started")
+    while not stop_evt.is_set():
+        pct = read_battery()
+        logging.info("state: %s", "disconnected" if pct is None else "%d%%" % pct)
+        try:
+            icon.icon = make_icon(pct if pct is not None else -1)
+            icon.title = title_for(pct if pct is not None else -1)
+        except Exception as e:
+            logging.warning("icon update failed: %s", e)
+        stop_evt.wait(RETRY_SEC if pct is None else POLL_SEC)
+    logging.info("poll loop stopped")
+
+
+_MUTEX = []
+
+
+def _acquire_single_instance():
+    """命名互斥体守卫：True=首个实例可运行，False=已有实例。
+
+    没有这个守卫时重复启动会出现多个托盘图标。
+    拿不到互斥体（异常）时一律放行，绝不因守卫本身挡住程序。
+    """
+    try:
+        import ctypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k.CreateMutexW(None, False, "Local\\SoraV3BatteryTray")
+        err = ctypes.get_last_error()
+        if not h:
+            return True
+        if err == 183:          # ERROR_ALREADY_EXISTS
+            return False
+        _MUTEX.append(h)        # 持有句柄，进程存活期间互斥体一直有效
+        return True
+    except Exception:
+        return True
+
+
+def _say(msg):
+    """日志 + 尽力打印（--windowed 下 sys.stdout 为 None，不能直接 print）。"""
+    logging.info(msg)
+    try:
+        if sys.stdout is not None:
+            print(msg)
+    except Exception:
+        pass
+
+
+def run_once():
+    if not candidate_paths():
+        _say("DISCONNECTED: no Sora V3 (VID %04X PID %04X)" % (VID, PID))
+        return 1
+    pct = read_battery()
+    if pct is None:
+        _say("NO_RESPONSE: device present but no battery returned")
+        return 1
+    _say("BATTERY %d%%" % pct)
+    return 0
+
+
+def main():
+    if "--once" in sys.argv:
+        return run_once()
+    if not _acquire_single_instance():
+        logging.info("another instance is already running; exiting")
+        return 0
+    stop_evt = threading.Event()
+    icon = pystray.Icon("sora_v3_battery", make_icon(-1), title_for(-1))
+    icon.menu = pystray.Menu(
+        pystray.MenuItem("刷新", lambda icon, item: None, default=True),
+        pystray.MenuItem("退出", lambda icon, item: (stop_evt.set(), icon.stop())),
+    )
+    logging.info("app starting")
+    icon.run(setup=lambda ic: poll_loop(ic, stop_evt))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        # windowed 模式下 stderr 为 None，异常会静默消失——必须落盘
+        logging.exception("fatal error")
+        raise
