@@ -5,6 +5,7 @@ __pycache__/
 # 运行时产物
 sora_v3_battery.log
 sora_v3_battery.json
+sora_v3_battery.mode
 *.log
 
 # 本地下载的第三方依赖

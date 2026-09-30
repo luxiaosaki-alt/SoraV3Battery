@@ -65,9 +65,10 @@ REQ = [0x06, 0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 POLL_SEC = 30        # 正常刷新间隔
 RETRY_SEC = 5        # 未连接时的探测间隔
-HIGH = (0x5A, 0xD2, 0x5A)    # >50% 绿
-MID = (0xF0, 0xC0, 0x40)     # 21-50% 黄
-LOW = (0xE6, 0x40, 0x40)     # <=20% 红
+HIGH_WHITE = (0xFF, 0xFF, 0xFF)  # 白图标：配深色任务栏（默认）
+HIGH_BLACK = (0x00, 0x00, 0x00)  # 黑图标：配浅色任务栏
+MID = (0xF0, 0xC0, 0x40)         # 21-50% 黄：两种模式都一样
+LOW = (0xE6, 0x40, 0x40)         # <=20% 红：两种模式都一样
 GONE = (0x99, 0x99, 0x99)
 
 LOG_PATH = os.path.join(_HERE, "sora_v3_battery.log")
@@ -133,23 +134,80 @@ def read_battery():
     return None
 
 
+# --- 托盘图标渲染 -----------------------------------------------------------
+# pystray 用 LoadImage(..., LR_DEFAULTSIZE) 载入图标，无论传入多大的图都会被
+# 重采样到 SM_CXICON（本机 32x32）。所以按 32 渲染是唯一能省掉那次重采样的
+# 尺寸：更大只会被压回去（两次廉价滤波叠加 = 糊），更小则先放大再缩小。
+ICON_NATIVE = 32                  # pystray 最终得到的 HICON 边长
+ICON_SS = 4                       # 内部超采样倍数，画完用 LANCZOS 缩回 ICON_NATIVE
+ICON_CANVAS = ICON_NATIVE * ICON_SS
+ICON_MARGIN = max(2, round(ICON_CANVAS * 4 / 256))   # 留给抗锯齿的边
+ICON_BOX = ICON_CANVAS - 2 * ICON_MARGIN
+
+#: 图标样式："battery" 画电池图形（默认），"digits" 直接画百分比数字。
+ICON_STYLE = "battery"
+
+#: 数字按长度分两档拟合：<=2 字符按最宽的两字符串定字号，"100" 单独一档。
+#: 若全部按 "100" 拟合，常见的两位数会被压小。
+_SIZE_REF_SHORT = tuple(str(n) for n in range(10, 100)) + ("--",)
+_SIZE_REF_LONG = ("100",)
+
+_SCRATCH_IMG = Image.new("RGBA", (8, 8))
+_SCRATCH = ImageDraw.Draw(_SCRATCH_IMG)
 _FONT_CACHE = {}
+_SIZE_CACHE = {}
+
+
+def _font_path():
+    root = os.environ.get("WINDIR", "C:/Windows")
+    for name in ("seguisb.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"):
+        p = os.path.join(root, "Fonts", name)
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def _font(size):
     if size not in _FONT_CACHE:
-        f = None
-        root = os.environ.get("WINDIR", "C:/Windows")
-        for name in ("seguisb.ttf", "arialbd.ttf", "segoeui.ttf", "arial.ttf"):
-            p = os.path.join(root, "Fonts", name)
-            if os.path.exists(p):
-                try:
-                    f = ImageFont.truetype(p, size)
-                    break
-                except Exception:
-                    pass
-        _FONT_CACHE[size] = f
+        path = _font_path()
+        try:
+            _FONT_CACHE[size] = ImageFont.truetype(path, size) if path else None
+        except Exception:
+            _FONT_CACHE[size] = None
     return _FONT_CACHE[size]
+
+
+#: 图标颜色：False=白图标，True=黑图标。
+#: 只影响 >50% 那一档，黄/红固定不变——颜色只留给告警。
+_BLACK_ICON = [False]
+#: 最近一次读到的电量。切换颜色要立刻重绘，不能等下一次轮询（最长 30 秒）。
+_LAST_PCT = [-1]
+MODE_PATH = os.path.join(_HERE, "sora_v3_battery.mode")
+
+
+def _load_mode():
+    """读取上次记住的图标颜色；读不到就默认白图标。
+
+    旧版本写的是 "dark"/"light"，一并以黑处理：升级不该把用户选的黑色图标
+    悄悄改回白色 —— 那正是这个功能要防的情况。
+    """
+    try:
+        with open(MODE_PATH, encoding="utf-8") as f:
+            return f.read().strip() in ("black", "dark")
+    except Exception:
+        return False
+
+
+def _save_mode():
+    """记住选择。存不下最多是下次回到默认，不该影响运行。"""
+    try:
+        with open(MODE_PATH, "w", encoding="utf-8") as f:
+            f.write("black" if _BLACK_ICON[0] else "white")
+    except Exception:
+        pass
+
+
+_BLACK_ICON[0] = _load_mode()
 
 
 def _color(pct):
@@ -159,43 +217,118 @@ def _color(pct):
         return LOW
     if pct <= 50:
         return MID
-    return HIGH
+    return HIGH_BLACK if _BLACK_ICON[0] else HIGH_WHITE
+
+
+def _ink(font, text, stroke):
+    """串在给定字体/描边下的墨迹宽高。"""
+    l, t, r, b = _SCRATCH.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    return r - l, b - t
+
+
+def _fitted_size(stroke, candidates):
+    """让 candidates 中最宽的串也能塞进 ICON_BOX 的最大字号。
+
+    关键：字号按**一组候选串**拟合，而不是按当前这一个串 —— 否则 "5" 会被
+    撑满、"100" 会被压小，电量每跳一格数字大小就变一次，看着很跳。
+    """
+    key = (stroke, candidates)
+    if key in _SIZE_CACHE:
+        return _SIZE_CACHE[key]
+    path = _font_path()
+    size = 8
+    if path is not None:
+        ref = ImageFont.truetype(path, 100)
+        est = []
+        for s in candidates:
+            w, h = _ink(ref, s, 0)
+            if w > 0 and h > 0:
+                est.append(int(100 * min(ICON_BOX / w, ICON_BOX / h)))
+        size = max(8, min(ICON_BOX, min(est, default=ICON_BOX)))
+        # 每次回退只建一次字体对象：候选串有近百个，建在循环内会白白多建 90 倍
+        while size > 8:
+            font = ImageFont.truetype(path, size)
+            if all(max(_ink(font, s, stroke)) <= ICON_BOX for s in candidates):
+                break
+            size -= 1
+    _SIZE_CACHE[key] = size
+    return size
+
+
+def _outline_color(rgb):
+    """给文字描边选颜色：亮字配黑边、暗字配白边，才能在任意任务栏底色上可读。"""
+    r, g, b = rgb
+    return (0, 0, 0) if (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.5 else (255, 255, 255)
+
+
+def _draw_text(dr, text, color):
+    """画数字（或 -- 占位），按自身墨迹居中，带描边。"""
+    stroke = max(2, round(ICON_BOX / 28))
+    candidates = _SIZE_REF_LONG if len(text) >= 3 else _SIZE_REF_SHORT
+    font = _font(_fitted_size(stroke, candidates))
+    if font is None:
+        return
+    l, t, r, b = dr.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    dr.text((round((ICON_CANVAS - (r - l)) / 2 - l),
+             round((ICON_CANVAS - (b - t)) / 2 - t)),
+            text, font=font, fill=color, stroke_width=stroke,
+            stroke_fill=_outline_color(color))
+
+
+def _draw_battery(dr, pct, color):
+    """画电池图形：圆角外壳 + 正极头 + 按电量比例填充。
+
+    几何用 256 的设计基准等比缩到 ICON_CANVAS，改比例时只动这些常数。
+    """
+    k = ICON_CANVAS / 256.0
+    stroke = round(16 * k)
+    dr.rounded_rectangle(
+        (round(16 * k), round(72 * k), round(224 * k), round(184 * k)),
+        radius=round(20 * k), outline=color, width=stroke)
+    dr.rounded_rectangle(
+        (round(226 * k), round(100 * k), round(248 * k), round(156 * k)),
+        radius=round(8 * k), fill=color)
+    fw = round(160 * pct / 100.0 * k)
+    if pct > 0 and fw > 0:
+        dr.rounded_rectangle(
+            (round(40 * k), round(96 * k), round(40 * k) + fw, round(96 * k) + round(64 * k)),
+            radius=round(8 * k), fill=color)
 
 
 def make_icon(pct):
-    """把电量画成托盘图标：数字 + 底部电量条。"""
-    S = 64
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    """把电量画成托盘图标：超采样绘制后 LANCZOS 缩到 ICON_NATIVE。"""
+    img = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (0, 0, 0, 0))
     dr = ImageDraw.Draw(img)
     color = _color(pct)
-    label = "--" if pct < 0 else str(pct)
-    size = 46
-    while size > 10:
-        f = _font(size)
-        if f is None:
-            break
-        l, t, r, b = dr.textbbox((0, 0), label, font=f)
-        if (r - l) <= 56 and (b - t) <= 44:
-            break
-        size -= 2
-    f = _font(size)
-    if f is not None:
-        l, t, r, b = dr.textbbox((0, 0), label, font=f)
-        dr.text(((S - (r - l)) / 2 - l, (S - (b - t)) / 2 - t - 3), label, font=f, fill=color)
+    if pct < 0 or ICON_STYLE == "digits":
+        # 未连接一律用文字占位：空电池会被误读成 0%
+        _draw_text(dr, "--" if pct < 0 else str(pct), color)
     else:
-        dr.rectangle((10, 18, 54, 42), outline=color, width=3)
-    if pct >= 0:
-        dr.rectangle((8, 55, 56, 61), outline=color, width=1)
-        w = int(46 * pct / 100.0)
-        if w > 0:
-            dr.rectangle((10, 57, 10 + w, 59), fill=color)
-    return img
+        _draw_battery(dr, pct, color)
+    return img.resize((ICON_NATIVE, ICON_NATIVE), Image.LANCZOS)
 
 
 def title_for(pct):
     if pct < 0:
         return "Sora V3: 未连接"
     return "Sora V3: %d%%" % pct
+
+
+def _mode_label(item):
+    """菜单文字说的是「点了会变成哪样」，所以显示的是另一种颜色。"""
+    return "用白色图标" if _BLACK_ICON[0] else "用黑色图标"
+
+
+def _toggle_icon_mode(icon, item):
+    """白/黑图标互切：立刻重绘，并刷新菜单文字。"""
+    _BLACK_ICON[0] = not _BLACK_ICON[0]
+    _save_mode()
+    logging.info("icon colour -> %s", "黑图标" if _BLACK_ICON[0] else "白图标")
+    try:
+        icon.icon = make_icon(_LAST_PCT[0])
+        icon.update_menu()
+    except Exception as e:
+        logging.warning("mode toggle failed: %s", e)
 
 
 # ---- 低电量提示的开关持久化 ------------------------------------------------
@@ -243,9 +376,10 @@ def poll_loop(icon, stop_evt, alerter, alert_cfg):
     logging.info("poll loop started")
     while not stop_evt.is_set():
         pct = read_battery()
+        _LAST_PCT[0] = -1 if pct is None else pct
         logging.info("state: %s", "disconnected" if pct is None else "%d%%" % pct)
         try:
-            icon.icon = make_icon(pct if pct is not None else -1)
+            icon.icon = make_icon(_LAST_PCT[0])
             icon.title = title_for(pct if pct is not None else -1)
         except Exception as e:
             logging.warning("icon update failed: %s", e)
@@ -342,6 +476,7 @@ def main():
                          checked=lambda item: alert_cfg["enabled"]),
         pystray.MenuItem("测试通知", _test_notify),
         pystray.MenuItem("刷新", lambda icon, item: None, default=True),
+        pystray.MenuItem(_mode_label, _toggle_icon_mode),
         pystray.MenuItem("退出", lambda icon, item: (stop_evt.set(), icon.stop())),
     )
     logging.info("app starting")
