@@ -81,6 +81,7 @@ pyinstaller --noconfirm --onedir --windowed --name SoraV3Battery \
 - **短连接**：每次读取都新建/关闭 HID 句柄，鼠标睡眠或重连时最稳。
 - **读取失败绝不抛异常**：任何 I/O 异常都降级为「未连接」，30 秒正常轮询、未连接时 5 秒重试。
 - **异常落盘**：`--windowed` 下 `sys.stderr` 为空，未捕获异常会静默消失，因此崩溃会写进 `sora_v3_battery.log`。
+- **日志有界**：用 `logging.handlers.RotatingFileHandler` 做大小轮转，单文件上限 512 KiB、保留 1 个 `.1` 备份，总占用始终 ≤ 1 MiB。30 秒一次的轮询每天约产生 140 KB 日志，不轮转会无界增长。
 
 ## 踩坑记录
 

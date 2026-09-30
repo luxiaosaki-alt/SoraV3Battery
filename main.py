@@ -13,6 +13,7 @@ import sys
 import time
 import threading
 import logging
+from logging.handlers import RotatingFileHandler
 
 # 打包成 exe 时用 exe 所在目录（日志、vendor 都相对它）；源码运行时用脚本目录
 if getattr(sys, "frozen", False):
@@ -66,8 +67,14 @@ LOW = (0xE6, 0x40, 0x40)     # <=20% 红
 GONE = (0x99, 0x99, 0x99)
 
 LOG_PATH = os.path.join(_HERE, "sora_v3_battery.log")
-logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+LOG_MAX_BYTES = 512 * 1024   # 单文件上限 512 KiB（约 3~4 天的轮询记录）
+LOG_BACKUPS = 1              # 保留 1 个 .1 备份，日志总占用有界 ≤ 1 MiB
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[RotatingFileHandler(LOG_PATH, maxBytes=LOG_MAX_BYTES,
+                                  backupCount=LOG_BACKUPS, encoding="utf-8")],
+)
 
 _GOOD_PATH = []   # 上次读成功的 collection，避免每次先试坏的那个
 
