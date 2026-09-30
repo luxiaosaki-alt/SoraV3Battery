@@ -67,7 +67,7 @@ pyinstaller --noconfirm --onedir --windowed --name SoraV3Battery \
 
 运行 `tools/install-task.ps1` 完成注册（无需管理员）。三个关键点：
 
-- 触发：**登录时** + **每 10 分钟重复**（持续 3650 天）。已经在跑的时候，重复触发会被程序的单实例互斥体挡掉，因此不会出现重复图标；被杀了则自动重启。
+- 触发：**登录时** + **每 2 分钟重复**（持续 3650 天）。已经在跑的时候，重复触发会被程序的单实例互斥体挡掉，因此不会出现重复图标；被杀了则最多 2 分钟内自动重启。
 - 设置：`ExecutionTimeLimit` 必须是**不限时**，否则计划程序会在默认 3 天后把常驻进程干掉；`MultipleInstances=IgnoreNew` 防并发。
 - 主体：`LogonType=Interactive` + `RunLevel=Limited`，托盘程序需要桌面会话，且不需要管理员权限。
 

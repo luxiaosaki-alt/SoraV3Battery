@@ -254,7 +254,9 @@ def main():
     if "--once" in sys.argv:
         return run_once()
     if not _acquire_single_instance():
-        logging.info("another instance is already running; exiting")
+        # 计划任务的保活触发每 2 分钟调用一次本程序；已在运行时静默退出，
+        # 用 debug 级别避免日志被这条正常路径刷屏。
+        logging.debug("another instance is already running; exiting")
         return 0
     stop_evt = threading.Event()
     icon = pystray.Icon("sora_v3_battery", make_icon(-1), title_for(-1))

@@ -11,8 +11,8 @@ $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $dir
 $atLogon = New-ScheduledTaskTrigger -AtLogOn -User $me
-# 每 10 分钟触发一次：已在运行时会被程序的单实例互斥体挡掉，被终止后能自动回来
-$keepAlive = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)
+# 每 2 分钟触发一次：已在运行时会被程序的单实例互斥体挡掉，被终止后最多 2 分钟内自动回来
+$keepAlive = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 3650)
 # ExecutionTimeLimit 必须是不限时(Zero)，否则计划程序会在默认 3 天后杀掉常驻进程
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
