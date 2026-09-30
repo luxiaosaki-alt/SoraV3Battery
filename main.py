@@ -61,9 +61,10 @@ REQ = [0x06, 0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 POLL_SEC = 30        # 正常刷新间隔
 RETRY_SEC = 5        # 未连接时的探测间隔
-HIGH = (0xFF, 0xFF, 0xFF)    # >50% 白：正常态不抢注意力，颜色只留给告警
-MID = (0xF0, 0xC0, 0x40)     # 21-50% 黄
-LOW = (0xE6, 0x40, 0x40)     # <=20% 红
+HIGH_WHITE = (0xFF, 0xFF, 0xFF)  # 浅色模式：白图标，配深色任务栏（默认）
+HIGH_BLACK = (0x00, 0x00, 0x00)  # 深色模式：黑图标，配浅色任务栏
+MID = (0xF0, 0xC0, 0x40)         # 21-50% 黄：两种模式都一样
+LOW = (0xE6, 0x40, 0x40)         # <=20% 红：两种模式都一样
 GONE = (0x99, 0x99, 0x99)
 
 LOG_PATH = os.path.join(_HERE, "sora_v3_battery.log")
@@ -172,6 +173,35 @@ def _font(size):
     return _FONT_CACHE[size]
 
 
+#: 图标模式：False=浅色模式（白图标），True=深色模式（黑图标）。
+#: 只影响 >50% 那一档，黄/红固定不变——颜色只留给告警。
+_DARK_ICON = [False]
+#: 最近一次读到的电量。切换模式要立刻重绘，不能等下一次轮询（最长 30 秒）。
+_LAST_PCT = [-1]
+MODE_PATH = os.path.join(_HERE, "sora_v3_battery.mode")
+
+
+def _load_mode():
+    """读取上次记住的图标模式；读不到就默认白图标。"""
+    try:
+        with open(MODE_PATH, encoding="utf-8") as f:
+            return f.read().strip() == "dark"
+    except Exception:
+        return False
+
+
+def _save_mode():
+    """记住选择。存不下最多是下次回到默认，不该影响运行。"""
+    try:
+        with open(MODE_PATH, "w", encoding="utf-8") as f:
+            f.write("dark" if _DARK_ICON[0] else "light")
+    except Exception:
+        pass
+
+
+_DARK_ICON[0] = _load_mode()
+
+
 def _color(pct):
     if pct < 0:
         return GONE
@@ -179,7 +209,7 @@ def _color(pct):
         return LOW
     if pct <= 50:
         return MID
-    return HIGH
+    return HIGH_BLACK if _DARK_ICON[0] else HIGH_WHITE
 
 
 def _ink(font, text, stroke):
@@ -276,6 +306,24 @@ def title_for(pct):
     return "Sora V3: %d%%" % pct
 
 
+def _mode_label(item):
+    """菜单文字说明「点了会变成哪种」，所以显示的是当前模式的另一种。"""
+    return "切换浅色模式" if _DARK_ICON[0] else "切换深色模式"
+
+
+def _toggle_icon_mode(icon, item):
+    """白/黑图标互切：立刻重绘，并刷新菜单文字。"""
+    _DARK_ICON[0] = not _DARK_ICON[0]
+    _save_mode()
+    logging.info("icon mode -> %s",
+                 "深色(黑图标)" if _DARK_ICON[0] else "浅色(白图标)")
+    try:
+        icon.icon = make_icon(_LAST_PCT[0])
+        icon.update_menu()
+    except Exception as e:
+        logging.warning("mode toggle failed: %s", e)
+
+
 def poll_loop(icon, stop_evt):
     """setup 线程：先显示图标，再轮询电量刷新。"""
     # 必须显式显示：pystray 只在 *没有* setup 回调时才自动 visible=True
@@ -283,9 +331,10 @@ def poll_loop(icon, stop_evt):
     logging.info("poll loop started")
     while not stop_evt.is_set():
         pct = read_battery()
+        _LAST_PCT[0] = -1 if pct is None else pct
         logging.info("state: %s", "disconnected" if pct is None else "%d%%" % pct)
         try:
-            icon.icon = make_icon(pct if pct is not None else -1)
+            icon.icon = make_icon(_LAST_PCT[0])
             icon.title = title_for(pct if pct is not None else -1)
         except Exception as e:
             logging.warning("icon update failed: %s", e)
@@ -351,6 +400,7 @@ def main():
     icon = pystray.Icon("sora_v3_battery", make_icon(-1), title_for(-1))
     icon.menu = pystray.Menu(
         pystray.MenuItem("刷新", lambda icon, item: None, default=True),
+        pystray.MenuItem(_mode_label, _toggle_icon_mode),
         pystray.MenuItem("退出", lambda icon, item: (stop_evt.set(), icon.stop())),
     )
     logging.info("app starting")
