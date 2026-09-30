@@ -61,9 +61,17 @@ pyinstaller --noconfirm --onedir --windowed --name SoraV3Battery \
 
 > 用 `--onedir` 而非 `--onefile`：onefile 会把带受限 DACL 的 `_MEI*` 解压目录建在临时目录里，在受限环境下会直接失败（`Failed to create parent directory structure`）。onedir 启动也更快。
 
-## 开机自启
+## 开机自启（计划任务，带自愈）
 
-把打包结果放到固定目录，然后在「启动」文件夹（`shell:startup`）放一个指向 `SoraV3Battery.exe` 的快捷方式即可，无需管理员权限。
+用**计划任务**而不是「启动」文件夹快捷方式：任务由计划程序服务托管、不依附任何父进程，还能配「重复触发 + 失败重启」，进程被外部终止后可以自己回来。
+
+运行 `tools/install-task.ps1` 完成注册（无需管理员）。三个关键点：
+
+- 触发：**登录时** + **每 10 分钟重复**（持续 3650 天）。已经在跑的时候，重复触发会被程序的单实例互斥体挡掉，因此不会出现重复图标；被杀了则自动重启。
+- 设置：`ExecutionTimeLimit` 必须是**不限时**，否则计划程序会在默认 3 天后把常驻进程干掉；`MultipleInstances=IgnoreNew` 防并发。
+- 主体：`LogonType=Interactive` + `RunLevel=Limited`，托盘程序需要桌面会话，且不需要管理员权限。
+
+> 之前用「启动」文件夹快捷方式，缺陷是只有登录这一次机会：进程一旦被终止，就没有任何机制把它拉起来，图标就此消失。
 
 若图标被 Windows 收进「隐藏的图标」溢出区，到 **设置 → 个性化 → 任务栏 → 其他系统托盘图标** 里把它打开。
 
