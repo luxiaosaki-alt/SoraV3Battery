@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import time
+import webbrowser
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
@@ -67,6 +68,7 @@ REQ = [0x06, 0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 POLL_SEC = 30        # 正常刷新间隔
 RETRY_SEC = 5        # 未连接时的探测间隔
+DRIVER_URL = "https://ninjaforce.ninjutso.cn/customization"  # 官方驱动设置页
 HIGH_WHITE = (0xFF, 0xFF, 0xFF)  # 白图标：配深色任务栏（默认）
 HIGH_BLACK = (0x00, 0x00, 0x00)  # 黑图标：配浅色任务栏
 MID = (0xF0, 0xC0, 0x40)         # 21-50% 黄：两种模式都一样
@@ -353,6 +355,24 @@ def _toggle_icon_mode(icon, item):
         logging.warning("mode toggle failed: %s", e)
 
 
+def _open_driver(icon, item):
+    """打开 ninjaforce 驱动设置页（托盘图标的默认项：单击/双击图标即触发）。
+
+    pystray 的默认项在每条 WM_LBUTTONUP 都触发，而双击是两条
+    WM_LBUTTONUP（中间夹一条它不处理的 DBLCLK），不去重会开出
+    两个标签——用单调时钟做 0.7s 内去重（系统双击间隔上限 500ms）。
+    """
+    now = time.monotonic()
+    if now - _LAST_OPEN[0] < 0.7:
+        return
+    _LAST_OPEN[0] = now
+    try:
+        webbrowser.open(DRIVER_URL)
+        logging.info("driver page opened: %s", DRIVER_URL)
+    except Exception as e:
+        logging.warning("open driver url failed: %s", e)
+
+
 # ---- 低电量提示的开关持久化 ------------------------------------------------
 
 CONFIG_PATH = os.path.join(_HERE, "sora_v3_battery.json")
@@ -394,6 +414,8 @@ def save_config(cfg):
 #: 请求轮询线程立刻重读一次（菜单「刷新」和「退出」用）。
 #: 不做成「菜单里自己读一遍」—— 那会和轮询线程同时开 HID 句柄抢设备。
 _WAKE = threading.Event()
+#: 上次打开驱动页的时刻（monotonic 秒）。双击的两条 WM_LBUTTONUP 去重用。
+_LAST_OPEN = [0.0]
 
 
 def poll_loop(icon, stop_evt, alerter, alert_cfg):
@@ -513,7 +535,8 @@ def main():
         pystray.MenuItem("低电量提示", _toggle_alerts,
                          checked=lambda item: alert_cfg["enabled"]),
         pystray.MenuItem("测试通知", _test_notify),
-        pystray.MenuItem("刷新", lambda icon, item: _WAKE.set(), default=True),
+        pystray.MenuItem("打开驱动设置", _open_driver, default=True),
+        pystray.MenuItem("刷新", lambda icon, item: _WAKE.set()),
         pystray.MenuItem(_mode_label, _toggle_icon_mode),
         pystray.MenuItem("退出",
                          lambda icon, item: (stop_evt.set(), _WAKE.set(), icon.stop())),
