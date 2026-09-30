@@ -391,12 +391,20 @@ def save_config(cfg):
         logging.warning("config write failed: %s", e)
 
 
+#: 请求轮询线程立刻重读一次（菜单「刷新」和「退出」用）。
+#: 不做成「菜单里自己读一遍」—— 那会和轮询线程同时开 HID 句柄抢设备。
+_WAKE = threading.Event()
+
+
 def poll_loop(icon, stop_evt, alerter, alert_cfg):
     """setup 线程：先显示图标，再轮询电量刷新 + 低电量判断。"""
     # 必须显式显示：pystray 只在 *没有* setup 回调时才自动 visible=True
     icon.visible = True
     logging.info("poll loop started")
     while not stop_evt.is_set():
+        # 进本轮先清唤醒标记：读取过程中来的「刷新」才会被保住，
+        # 让下面那次 wait 立刻返回、紧接着再读一遍。
+        _WAKE.clear()
         pct, charging = read_battery()
         _LAST_PCT[0] = -1 if pct is None else pct
         _LAST_CHARGING[0] = bool(charging and pct is not None)
@@ -420,7 +428,9 @@ def poll_loop(icon, stop_evt, alerter, alert_cfg):
                     icon.notify(body, title)
                 except Exception as e:
                     logging.warning("notify failed: %s", e)
-        stop_evt.wait(RETRY_SEC if pct is None else POLL_SEC)
+        # 正常情况在此超时；被 set 说明点了「刷新」（马上重读）
+        # 或「退出」（下一轮开头就会跳出循环）
+        _WAKE.wait(RETRY_SEC if pct is None else POLL_SEC)
     logging.info("poll loop stopped")
 
 
@@ -503,9 +513,10 @@ def main():
         pystray.MenuItem("低电量提示", _toggle_alerts,
                          checked=lambda item: alert_cfg["enabled"]),
         pystray.MenuItem("测试通知", _test_notify),
-        pystray.MenuItem("刷新", lambda icon, item: None, default=True),
+        pystray.MenuItem("刷新", lambda icon, item: _WAKE.set(), default=True),
         pystray.MenuItem(_mode_label, _toggle_icon_mode),
-        pystray.MenuItem("退出", lambda icon, item: (stop_evt.set(), icon.stop())),
+        pystray.MenuItem("退出",
+                         lambda icon, item: (stop_evt.set(), _WAKE.set(), icon.stop())),
     )
     logging.info("app starting")
     icon.run(setup=lambda ic: poll_loop(ic, stop_evt, alerter, alert_cfg))
