@@ -87,7 +87,8 @@ logging.basicConfig(
 )
 
 _GOOD_PATH = []   # 上次读成功的 (pid, path)，避免每次先试坏的那个
-_ZERO_RUN = [False]  # 接收器是否正处于「深睡应答 0」状态，用于只在状态切换时记日志
+_NO_ECHO_RUN = [False]   # 是否正处于「应答无回显」状态（鼠标深睡/失联），只记状态切换日志
+_LAST_NO_ECHO = [False]  # 最近一次 _try_read 是否为无回显应答，供 read_battery 提前定论
 
 
 def candidate_paths():
@@ -111,22 +112,31 @@ def candidate_paths():
 
 
 def _try_read(path):
-    """对单个 path 读一次电量；失败返回 None（绝不抛出）。"""
+    """对单个 path 读一次电量；失败返回 None（绝不抛出）。
+
+    校验：回包必须回显 report ID（0x06）和命令字（0x12）。实测鼠标
+    深睡后接收器应答「只回显 report ID、其余全零」的包
+    （[06 00 00 ... 00]），byte[8] 也是 0——不校验回显就会把深睡
+    当成真实的 0% 电量（曾因此显示 0 并弹过假警报）。
+    """
     d = hid.device()
     try:
         d.open_path(path)
         d.send_feature_report(REQ)
         time.sleep(0.012)
         r = d.get_feature_report(RID, 16)
-        if len(r) > 8 and 0 <= r[8] <= 100:
-            if r[8] == 0 and not _ZERO_RUN[0]:
-                # 原始包留档：接收器深睡应答 0 的判别字节还没定论，留着以后分析。
-                # 只记零段的第一条，深睡期 5s 一轮的频率会刷爆轮转日志。
-                logging.info("zero battery response: %s", list(r))
+        if len(r) > 8 and r[0] == RID and r[1] == REQ[1] and 0 <= r[8] <= 100:
+            _LAST_NO_ECHO[0] = False
+            _NO_ECHO_RUN[0] = False
             return r[8]
-        logging.warning("unexpected response: %s", list(r))
+        _LAST_NO_ECHO[0] = True
+        if not _NO_ECHO_RUN[0]:
+            # 原始包留档；只记零段第一条——深睡期 5s 一轮会刷爆轮转日志
+            logging.info("no-echo response (device asleep / no link?): %s", list(r))
+            _NO_ECHO_RUN[0] = True
         return None
     except Exception as e:
+        _LAST_NO_ECHO[0] = False
         logging.info("read failed on %s: %s", path, e)
         return None
     finally:
@@ -153,20 +163,12 @@ def read_battery():
                 if not _GOOD_PATH or _GOOD_PATH[0] != (pid, p):
                     _GOOD_PATH[:] = [(pid, p)]
                     logging.info("using path: %s (pid=%04X)", p, pid)
-                if pct == 0 and not charging:
-                    # 接收器应答 0% 只出现在鼠标深睡/失联：实测空闲时段每次
-                    # 轮询都应答 0，一动鼠标立刻恢复真实值；而真 0% 的鼠标
-                    # 几分钟内就会没电关机失联，两者无法区分且表现一致——
-                    # 一律按未连接处理，不当真、也不喂给告警（曾因此弹过
-                    # 「电量严重不足：0%」的假警报）。有线直连不受此影响：
-                    # 插着线的鼠标不会深睡，0 就是真的 0。
-                    if not _ZERO_RUN[0]:
-                        logging.info("receiver reports 0, treating as no-link "
-                                     "(mouse deep sleep?)")
-                        _ZERO_RUN[0] = True
-                    return None, False
-                _ZERO_RUN[0] = False
                 return pct, charging
+            if _LAST_NO_ECHO[0]:
+                # 无回显 = 接收器那边没有活数据（鼠标深睡/失联），同一台
+                # 接收器的另一个 collection 也给不出更多——直接定论，
+                # 顺带省掉坏 collection 每轮一次的 read-error 日志。
+                break
     return None, False
 
 
