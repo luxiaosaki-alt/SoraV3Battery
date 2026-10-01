@@ -1,6 +1,8 @@
 # Sora V3 电量托盘指示器
 
-常驻 Windows 系统托盘（通知区），实时显示 **Ninjutso Sora V3** 无线鼠标的电量百分比，不必再打开官方驱动网页。
+常驻 Windows 系统托盘，实时显示 **Ninjutso Sora V3** 无线鼠标的电量：图标随电量变色，低电量/充满自动弹通知，插线充电转青色显示，单击图标直达 ninjaforce 驱动设置页。
+
+**[下载最新版](https://github.com/luxiaosaki-alt/SoraV3Battery/releases/latest)**：zip 解压即用，依赖已全部打包，无需安装 Python。
 
 ![托盘显示](promoted_tray.png)
 
@@ -43,9 +45,14 @@
 pip install -r requirements.txt
 ```
 
-## 使用
+## 安装与使用
+
+**exe 方式（推荐）**：从 [Releases](https://github.com/luxiaosaki-alt/SoraV3Battery/releases/latest) 下载 zip，解压到任意目录后双击 `SoraV3Battery.exe`。要开机自启 + 崩溃自愈，再运行一次 `tools/install-task.ps1`（见[开机自启](#开机自启计划任务带自愈)）。
+
+**源码方式**：
 
 ```sh
+pip install -r requirements.txt
 python main.py --once    # 只读一次电量并打印，用于验证协议
 python main.py           # 常驻托盘
 ```
@@ -54,9 +61,9 @@ python main.py           # 常驻托盘
 
 右键菜单六项：**电量提示**（开关，管低电量与充满两类通知）/ **测试通知** / **打开驱动设置**（默认项——单击或双击图标即用默认浏览器打开 ninjaforce 驱动页 `https://ninjaforce.ninjutso.cn/customization`）/ **刷新**（立刻重读一次）/ **用黑色图标**（或「用白色图标」，视当前颜色而定）/ **退出**。
 
-## 低电量提示
+## 电量提示（低电量 + 充满）
 
-电量跌破阈值时弹出 Windows 通知（托盘气泡，Win10/11 上即系统 toast，会进操作中心）：
+Windows 通知（托盘气泡，Win10/11 上即系统 toast，会进操作中心）分两类，共用右键菜单里的「电量提示」开关：
 
 - 两级阈值：**20%** 提示「电量低」，**10%** 提示「电量严重不足」；
 - **每个放电周期每级只弹一次**：持续低于阈值不会重复弹；充电回升到阈值 +5% 以上后重新武装；
@@ -153,7 +160,7 @@ pyinstaller --noconfirm --onedir --windowed --name SoraV3Battery \
 ## 运行测试
 
 ```sh
-python tests/test_alert.py   # 低电量提示状态机的 12 个单测，无需任何第三方库
+python -m unittest discover -s tests -t .   # 26 个单测（电量提示状态机 + 协议回包校验），无需任何第三方库
 ```
 
 ## 踩坑记录
