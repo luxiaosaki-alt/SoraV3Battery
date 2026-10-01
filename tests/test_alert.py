@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from alerts import LowBatteryAlerter, alert_message
+from alerts import FullChargeNotifier, LowBatteryAlerter, alert_message
 
 
 T0 = 1000.0
@@ -86,6 +86,40 @@ class TestLowBatteryAlerter(unittest.TestCase):
         self.assertIsNone(a.update(14, T0 + 30))
         self.assertEqual(a.update(21, T0 + 3600), None)  # 21>=15+5，重新武装
         self.assertEqual(a.update(10, T0 + 7200), 15)
+
+
+class TestFullChargeNotifier(unittest.TestCase):
+    def test_fires_once_at_100_charging(self):
+        f = FullChargeNotifier()
+        self.assertFalse(f.update(99, True))
+        self.assertTrue(f.update(100, True))
+
+    def test_no_repeat_while_plugged(self):
+        f = FullChargeNotifier()
+        f.update(100, True)
+        for pct in (100, 99, 100, 100):     # 插着线读数小幅抖动不重报
+            self.assertFalse(f.update(pct, True))
+
+    def test_no_fire_below_100(self):
+        f = FullChargeNotifier()
+        for pct in (10, 50, 80, 95):
+            self.assertFalse(f.update(pct, True))
+
+    def test_unplug_resets(self):
+        f = FullChargeNotifier()
+        f.update(100, True)                 # 报过一次
+        self.assertFalse(f.update(90, False))   # 拔线，复位
+        self.assertFalse(f.update(60, True))
+        self.assertTrue(f.update(100, True))    # 下个充电周期再报
+
+    def test_wired_zero_charging_not_full(self):
+        f = FullChargeNotifier()
+        self.assertFalse(f.update(0, True))   # 有线真 0%：刚插上没电的鼠标
+
+    def test_never_fires_without_charging(self):
+        f = FullChargeNotifier()
+        for _ in range(3):
+            self.assertFalse(f.update(100, False))
 
 
 if __name__ == "__main__":

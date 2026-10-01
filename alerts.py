@@ -1,4 +1,4 @@
-"""低电量提示状态机。
+"""低电量提示状态机 + 充满电提示。
 
 纯逻辑、无 I/O：喂入电量读数，返回「此刻应弹出哪一级提示」。
 本模块的全部职责是**去重**——30 秒一轮的轮询若不做去重，电量低于
@@ -80,3 +80,27 @@ def alert_message(stage, pct, urgent_stage):
     if stage <= urgent_stage:
         return ("Sora V3 电量严重不足：%d%%" % pct, "电量即将耗尽，请立即充电。")
     return ("Sora V3 电量低：%d%%" % pct, "请尽快充电。")
+
+
+class FullChargeNotifier:
+    """充满电提示：充电中到达 100% 报一次，拔线即复位。
+
+    与 LowBatteryAlerter 同一套边沿触发思路，但只有 100% 一档：
+    - 充电中首次读到 >=100 报一次，之后插着线不再重复（哪怕读数
+      在 100 附近小幅抖动）；
+    - 拔线（非充电读数）复位——下次充满会再报，一个充电周期一条；
+    - 非充电读数永远不会触发（没插线谈何充满）。
+    """
+
+    def __init__(self):
+        self._fired = False
+
+    def update(self, pct, charging):
+        """喂入一次电量读数。返回 True 表示此刻应弹『已充满』。"""
+        if not charging:
+            self._fired = False
+            return False
+        if self._fired or pct < 100:
+            return False
+        self._fired = True
+        return True

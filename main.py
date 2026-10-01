@@ -32,7 +32,7 @@ import hid
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
-from alerts import LowBatteryAlerter, alert_message
+from alerts import LowBatteryAlerter, FullChargeNotifier, alert_message
 from protocol import (VID, PID, WIRED_PID, RID, USAGE_PAGE, USAGE, REQ,
                       validate_response)
 
@@ -434,7 +434,7 @@ _WAKE = threading.Event()
 _LAST_OPEN = [0.0]
 
 
-def poll_loop(icon, stop_evt, alerter, alert_cfg):
+def poll_loop(icon, stop_evt, alerter, full_charge, alert_cfg):
     """setup 线程：先显示图标，再轮询电量刷新 + 低电量判断。"""
     # 必须显式显示：pystray 只在 *没有* setup 回调时才自动 visible=True
     icon.visible = True
@@ -464,6 +464,14 @@ def poll_loop(icon, stop_evt, alerter, alert_cfg):
                     # 气泡在 Win10/11 上渲染为系统 toast，同 Shell_NotifyIcon
                     # 路径，与上面跨线程刷新图标一致，可安全调用
                     icon.notify(body, title)
+                except Exception as e:
+                    logging.warning("notify failed: %s", e)
+        # 充满电：只在充电态评估（拔线在 update 内部复位），充满只报一次
+        if pct is not None and alert_cfg["enabled"]:
+            if full_charge.update(pct, charging):
+                logging.info("full charge notify: pct=%d", pct)
+                try:
+                    icon.notify("电量 100%，可以拔线了。", "Sora V3 已充满")
                 except Exception as e:
                     logging.warning("notify failed: %s", e)
         # 正常情况在此超时；被 set 说明点了「刷新」（马上重读）
@@ -531,6 +539,7 @@ def main():
     cfg = load_config()
     alert_cfg = {"enabled": cfg["alerts_enabled"]}
     alerter = LowBatteryAlerter(stages=(cfg["alert_warn"], cfg["alert_urgent"]))
+    full_charge = FullChargeNotifier()
 
     def _toggle_alerts(icon, item):
         alert_cfg["enabled"] = not alert_cfg["enabled"]
@@ -548,7 +557,7 @@ def main():
     stop_evt = threading.Event()
     icon = pystray.Icon("sora_v3_battery", make_icon(-1), title_for(-1))
     icon.menu = pystray.Menu(
-        pystray.MenuItem("低电量提示", _toggle_alerts,
+        pystray.MenuItem("电量提示", _toggle_alerts,
                          checked=lambda item: alert_cfg["enabled"]),
         pystray.MenuItem("测试通知", _test_notify),
         pystray.MenuItem("打开驱动设置", _open_driver, default=True),
@@ -558,7 +567,7 @@ def main():
                          lambda icon, item: (stop_evt.set(), _WAKE.set(), icon.stop())),
     )
     logging.info("app starting")
-    icon.run(setup=lambda ic: poll_loop(ic, stop_evt, alerter, alert_cfg))
+    icon.run(setup=lambda ic: poll_loop(ic, stop_evt, alerter, full_charge, alert_cfg))
     return 0
 
 
