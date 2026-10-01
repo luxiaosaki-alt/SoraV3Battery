@@ -148,7 +148,7 @@ pyinstaller --noconfirm --onedir --windowed --name SoraV3Battery \
 - **读取失败绝不抛异常**：任何 I/O 异常都降级为「未连接」，30 秒正常轮询、未连接时 5 秒重试。
 - **低电量提示去重**：`alerts.py` 是纯逻辑状态机（不依赖 hid/pystray），边沿触发 + 迟滞复位 + 冷却兜底，详见模块注释；通知用 pystray 自带气泡，零新增依赖。
 - **异常落盘**：`--windowed` 下 `sys.stderr` 为空，未捕获异常会静默消失，因此崩溃会写进 `sora_v3_battery.log`。
-- **日志有界**：用 `logging.handlers.RotatingFileHandler` 做大小轮转，单文件上限 512 KiB、保留 1 个 `.1` 备份，总占用始终 ≤ 1 MiB。30 秒一次的轮询每天约产生 140 KB 日志，不轮转会无界增长。
+- **日志有界**：用 `logging.handlers.RotatingFileHandler` 做大小轮转，单文件上限 512 KiB、保留 1 个 `.1` 备份，总占用始终 ≤ 1 MiB。日志记「事件流」：状态变化才记一条，状态不变时每 30 分钟心跳一条证明轮询还活着——否则深睡期 5 秒一轮会把日志一天冲掉两轮，真正出问题那天的日志反而被冲掉。
 
 ## 运行测试
 

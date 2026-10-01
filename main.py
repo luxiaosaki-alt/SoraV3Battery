@@ -64,6 +64,7 @@ _patch_pystray_message_filter()
 
 POLL_SEC = 30        # 正常刷新间隔
 RETRY_SEC = 5        # 未连接时的探测间隔
+STATE_HEARTBEAT_SEC = 30 * 60  # 状态不变时的日志心跳间隔：静默期也能证明轮询还活着
 DRIVER_URL = "https://ninjaforce.ninjutso.cn/customization"  # 官方驱动设置页
 HIGH_WHITE = (0xFF, 0xFF, 0xFF)  # 白图标：配深色任务栏（默认）
 HIGH_BLACK = (0x00, 0x00, 0x00)  # 黑图标：配浅色任务栏
@@ -439,6 +440,11 @@ def poll_loop(icon, stop_evt, alerter, full_charge, alert_cfg):
     # 必须显式显示：pystray 只在 *没有* setup 回调时才自动 visible=True
     icon.visible = True
     logging.info("poll loop started")
+    # 日志记「事件流」而不是每个轮询周期：状态不变就沉默，每 30 分钟
+    # 心跳一条证明轮询还活着。否则深睡期 5s 一轮会把轮转日志一天冲掉
+    # 两轮，真正出问题那天的日志反而被冲掉（2026-10-01 排查假 0 差点如此）。
+    last_state = None       # (pct, charging) 上次记录过的状态
+    last_logged_at = 0.0    # time.monotonic()
     while not stop_evt.is_set():
         # 进本轮先清唤醒标记：读取过程中来的「刷新」才会被保住，
         # 让下面那次 wait 立刻返回、紧接着再读一遍。
@@ -446,8 +452,13 @@ def poll_loop(icon, stop_evt, alerter, full_charge, alert_cfg):
         pct, charging = read_battery()
         _LAST_PCT[0] = -1 if pct is None else pct
         _LAST_CHARGING[0] = bool(charging and pct is not None)
-        logging.info("state: %s", "disconnected" if pct is None
-                     else "%d%%%s" % (pct, " charging" if charging else ""))
+        state = (pct, _LAST_CHARGING[0])
+        now = time.monotonic()
+        if state != last_state or now - last_logged_at >= STATE_HEARTBEAT_SEC:
+            logging.info("state: %s", "disconnected" if pct is None
+                         else "%d%%%s" % (pct, " charging" if charging else ""))
+            last_state = state
+            last_logged_at = now
         try:
             icon.icon = make_icon(_LAST_PCT[0], _LAST_CHARGING[0])
             icon.title = title_for(pct if pct is not None else -1, _LAST_CHARGING[0])
