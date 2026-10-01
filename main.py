@@ -87,6 +87,7 @@ logging.basicConfig(
 )
 
 _GOOD_PATH = []   # 上次读成功的 (pid, path)，避免每次先试坏的那个
+_ZERO_RUN = [False]  # 接收器是否正处于「深睡应答 0」状态，用于只在状态切换时记日志
 
 
 def candidate_paths():
@@ -118,6 +119,10 @@ def _try_read(path):
         time.sleep(0.012)
         r = d.get_feature_report(RID, 16)
         if len(r) > 8 and 0 <= r[8] <= 100:
+            if r[8] == 0 and not _ZERO_RUN[0]:
+                # 原始包留档：接收器深睡应答 0 的判别字节还没定论，留着以后分析。
+                # 只记零段的第一条，深睡期 5s 一轮的频率会刷爆轮转日志。
+                logging.info("zero battery response: %s", list(r))
             return r[8]
         logging.warning("unexpected response: %s", list(r))
         return None
@@ -148,6 +153,19 @@ def read_battery():
                 if not _GOOD_PATH or _GOOD_PATH[0] != (pid, p):
                     _GOOD_PATH[:] = [(pid, p)]
                     logging.info("using path: %s (pid=%04X)", p, pid)
+                if pct == 0 and not charging:
+                    # 接收器应答 0% 只出现在鼠标深睡/失联：实测空闲时段每次
+                    # 轮询都应答 0，一动鼠标立刻恢复真实值；而真 0% 的鼠标
+                    # 几分钟内就会没电关机失联，两者无法区分且表现一致——
+                    # 一律按未连接处理，不当真、也不喂给告警（曾因此弹过
+                    # 「电量严重不足：0%」的假警报）。有线直连不受此影响：
+                    # 插着线的鼠标不会深睡，0 就是真的 0。
+                    if not _ZERO_RUN[0]:
+                        logging.info("receiver reports 0, treating as no-link "
+                                     "(mouse deep sleep?)")
+                        _ZERO_RUN[0] = True
+                    return None, False
+                _ZERO_RUN[0] = False
                 return pct, charging
     return None, False
 
