@@ -33,6 +33,8 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 from alerts import LowBatteryAlerter, alert_message
+from protocol import (VID, PID, WIRED_PID, RID, USAGE_PAGE, USAGE, REQ,
+                      validate_response)
 
 
 def _patch_pystray_message_filter():
@@ -60,12 +62,6 @@ def _patch_pystray_message_filter():
 
 _patch_pystray_message_filter()
 
-VID, PID = 0x093A, 0xEB02          # Sora V3 4K 接收器
-WIRED_PID = 0xE010                 # 有线模式下的鼠标本体（此时接收器不可见，见 README 踩坑记录）
-RID = 0x06                          # 主通道 feature report ID
-USAGE_PAGE, USAGE = 0xFF01, 0x0001  # 电量 collection 的 usage（MI_02 上有两个同值 collection）
-REQ = [0x06, 0x12, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 POLL_SEC = 30        # 正常刷新间隔
 RETRY_SEC = 5        # 未连接时的探测间隔
 DRIVER_URL = "https://ninjaforce.ninjutso.cn/customization"  # 官方驱动设置页
@@ -124,15 +120,15 @@ def _try_read(path):
         d.open_path(path)
         d.send_feature_report(REQ)
         time.sleep(0.012)
-        r = d.get_feature_report(RID, 16)
-        if len(r) > 8 and r[0] == RID and r[1] == REQ[1] and 0 <= r[8] <= 100:
+        pct = validate_response(d.get_feature_report(RID, 16))
+        if pct is not None:
             _LAST_NO_ECHO[0] = False
             _NO_ECHO_RUN[0] = False
-            return r[8]
+            return pct
         _LAST_NO_ECHO[0] = True
         if not _NO_ECHO_RUN[0]:
             # 原始包留档；只记零段第一条——深睡期 5s 一轮会刷爆轮转日志
-            logging.info("no-echo response (device asleep / no link?): %s", list(r))
+            logging.info("no-echo response (device asleep / no link?)")
             _NO_ECHO_RUN[0] = True
         return None
     except Exception as e:
